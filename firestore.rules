@@ -1,0 +1,142 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required)
+    //   - email: string (required, email format)
+    //   - displayName: string (optional)
+    //   - photoURL: string (optional)
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: quizzes
+    // Document ID: {quizId}
+    // Fields:
+    //   - title: string (required, 1-100 chars)
+    //   - description: string (optional, 0-500 chars)
+    //   - creatorId: string (required, matches auth.uid)
+    //   - creatorName: string (required)
+    //   - questions: list (required, 1-50 items)
+    //   - theme: string (optional)
+    //   - createdAt: timestamp (required)
+    //
+    // Collection: quizzes/{quizId}/responses
+    // Document ID: {responseId}
+    // Fields:
+    //   - quizId: string (required)
+    //   - respondentName: string (required, 1-50 chars)
+    //   - answers: list (required)
+    //   - score: number (required)
+    //   - totalQuestions: number (required)
+    //   - createdAt: timestamp (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isAdmin() {
+      return isAuthenticated() && 
+        (get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin' ||
+         (request.auth.token.email == "padhai.aniruddhaade@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidTimestamp(ts) {
+      return ts is timestamp;
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.uid == request.auth.uid &&
+             isValidEmail(data.email);
+    }
+
+    function isValidQuiz(data) {
+      return data.keys().hasAll(['title', 'creatorId', 'creatorName', 'questions', 'createdAt']) &&
+             data.title is string && data.title.size() >= 1 && data.title.size() <= 100 &&
+             data.creatorId == request.auth.uid &&
+             data.questions is list && data.questions.size() >= 1 && data.questions.size() <= 50 &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidResponse(data) {
+      return data.keys().hasAll(['quizId', 'respondentName', 'answers', 'score', 'totalQuestions', 'createdAt']) &&
+             data.respondentName is string && data.respondentName.size() >= 1 && data.respondentName.size() <= 50 &&
+             data.answers is list &&
+             data.score is number &&
+             (data.type == 'standard' || data.type == 'secret-dump') &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isAuthenticated();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /responses/{responseId} {
+      // Allow read if user is the creator of the quiz
+      // We use a helper to check the quiz creator
+      allow read: if isAuthenticated() && (get(/databases/$(database)/documents/quizzes/$(resource.data.quizId)).data.creatorId == request.auth.uid || isAdmin());
+      
+      // Anyone can submit a response
+      allow create: if isValidResponse(request.resource.data);
+      
+      // Allow deletion if user is the creator of the quiz
+      // This is needed for the cleanup when a quiz is deleted
+      allow delete: if isAuthenticated() && (get(/databases/$(database)/documents/quizzes/$(resource.data.quizId)).data.creatorId == request.auth.uid || isAdmin());
+      
+      allow update: if isAdmin();
+    }
+
+    match /quizzes/{quizId} {
+      // Publicly readable so people can take the quiz
+      allow read: if true;
+      allow create: if isAuthenticated() && isValidQuiz(request.resource.data);
+      allow update: if isAuthenticated() && (resource.data.creatorId == request.auth.uid || isAdmin()) && 
+                      isValidQuiz(request.resource.data) &&
+                      request.resource.data.creatorId == resource.data.creatorId &&
+                      request.resource.data.createdAt == resource.data.createdAt;
+      allow delete: if isAuthenticated() && (resource.data.creatorId == request.auth.uid || isAdmin());
+
+      match /responses/{responseId} {
+        // Subcollection rules should mirror top-level if both are used
+        allow read: if isAuthenticated() && (get(/databases/$(database)/documents/quizzes/$(quizId)).data.creatorId == request.auth.uid || isAdmin());
+        allow create: if isValidResponse(request.resource.data);
+        allow delete: if isAuthenticated() && (get(/databases/$(database)/documents/quizzes/$(quizId)).data.creatorId == request.auth.uid || isAdmin());
+        allow update: if isAdmin();
+      }
+    }
+
+    // Default deny
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
